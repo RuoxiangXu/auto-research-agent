@@ -1,0 +1,24 @@
+[project]
+name = "autoresearch"
+version = "0.1.0"
+description = "AI-Powered Deep Research Assistant built with LangGraph"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0.0",
+    "langchain>=1.2.0",
+    "langchain-openai>=1.1.0",
+    "langchain-community>=0.3.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "tavily-python>=0.5.0",
+    "ddgs>=6.0.0",
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "aiosqlite>=0.20.0",
+    "pydantic>=2.0.0",
+    "mcp>=1.20.0",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
