@@ -84,4 +84,87 @@ a:hover {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-light);
 }
+
+/* ── Shared Markdown body styles ─────────────────────────────────────── */
+.md-body h1 {
+  font-size: 1.6rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.4rem;
+  margin: 1.5rem 0 0.75rem;
+}
+.md-body h2 {
+  font-size: 1.3rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+  margin: 1.25rem 0 0.6rem;
+}
+.md-body h3 {
+  font-size: 1.1rem;
+  margin: 1rem 0 0.5rem;
+}
+.md-body p {
+  margin: 0.6rem 0;
+  line-height: 1.7;
+}
+.md-body ul,
+.md-body ol {
+  margin: 0.5rem 0;
+  padding-left: 1.5rem;
+}
+.md-body li {
+  margin: 0.3rem 0;
+}
+.md-body code {
+  font-family: var(--font-mono);
+  background: var(--bg-tertiary);
+  padding: 0.15rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.88em;
+}
+.md-body pre {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+}
+.md-body pre code {
+  background: none;
+  padding: 0;
+}
+.md-body blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 1rem;
+  color: var(--text-secondary);
+  margin: 0.75rem 0;
+}
+.md-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.75rem 0;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+.md-body th {
+  background: var(--bg-tertiary);
+  font-weight: 600;
+}
+.md-body a {
+  color: var(--accent);
+  word-break: break-all;
+}
+.md-body strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.md-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.5rem 0;
+}
 </style>
