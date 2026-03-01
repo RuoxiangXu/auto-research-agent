@@ -35,7 +35,7 @@ async def test_save_and_get_report(_temp_db):
     report_id = await database.save_report("test topic", "# Report", tasks)
 
     assert report_id is not None
-    assert len(report_id) > 0
+    assert len(report_id) == 36  # full UUID format: 8-4-4-4-12
 
     report = await database.get_report(report_id)
     assert report is not None

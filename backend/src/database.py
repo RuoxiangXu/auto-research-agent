@@ -29,7 +29,7 @@ async def init_db():
 
 async def save_report(topic: str, report_markdown: str, tasks: list[dict]) -> str:
     """Save a research report and return its ID."""
-    report_id = str(uuid.uuid4())[:8]
+    report_id = str(uuid.uuid4())
     created_at = datetime.now().isoformat()
 
     serializable_tasks = []
