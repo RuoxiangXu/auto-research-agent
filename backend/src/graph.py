@@ -132,16 +132,16 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
 
             logger.info(f"{tag} Summarizer 完成 → {len(summary)} chars")
 
-            # ── Self-correction ──────────────────────────────────────
+            # ── Self-correction loop ───────────────────────────────────
             cfg = get_config()
-            if cfg.max_retry_count > 0:
+            for retry_round in range(cfg.max_retry_count):
                 await queue.put({
                     "type": "status",
                     "message": f"评估质量：{task['title']}",
                     "task_id": task_id,
                 })
 
-                logger.info(f"{tag} 正在执行 Evaluator Agent | 评估总结质量")
+                logger.info(f"{tag} Evaluator Agent (round {retry_round + 1}/{cfg.max_retry_count})")
 
                 eval_user_msg = (
                     f"任务意图：{task['intent']}\n\n"
@@ -155,51 +155,61 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
                 ])
 
                 needs_retry, refined_query = _parse_evaluation(eval_response.content)
-                logger.info(f"{tag} Evaluator 完成 → needs_retry={needs_retry}" + (f", refined_query={refined_query!r}" if refined_query else ""))
+                logger.info(f"{tag} Evaluator → needs_retry={needs_retry}" + (f", refined_query={refined_query!r}" if refined_query else ""))
 
-                if needs_retry and refined_query:
-                    await queue.put({
-                        "type": "status",
-                        "message": f"自纠错：补充搜索 — {refined_query}",
-                        "task_id": task_id,
-                    })
+                if not needs_retry or not refined_query:
+                    break
 
-                    logger.info(f"{tag} 补充搜索 | query={refined_query!r}")
-                    new_results = await perform_search(refined_query, search_api)
-                    logger.info(f"{tag} 补充搜索完成 → {len(new_results)} 条结果")
-                    search_results.extend(new_results)
-                    context = format_search_context(search_results)
+                await queue.put({
+                    "type": "status",
+                    "message": f"自纠错 ({retry_round + 1}/{cfg.max_retry_count})：补充搜索 — {refined_query}",
+                    "task_id": task_id,
+                })
 
-                    await queue.put({
-                        "type": "task_summary_clear",
-                        "task_id": task_id,
-                    })
+                logger.info(f"{tag} 补充搜索 | query={refined_query!r}")
+                new_results = await perform_search(refined_query, search_api)
+                logger.info(f"{tag} 补充搜索完成 → {len(new_results)} 条结果")
+                search_results.extend(new_results)
 
-                    logger.info(f"{tag} 正在执行 Summarizer Agent (重试) | {task['title']!r}")
+                # Push updated sources to frontend
+                await queue.put({
+                    "type": "sources",
+                    "task_id": task_id,
+                    "sources": search_results,
+                })
 
-                    summary = ""
-                    retry_prompt = (
-                        f"研究主题：{topic}\n"
-                        f"任务：{task['title']}\n"
-                        f"意图：{task['intent']}\n"
-                        f"搜索查询：{task['query']}\n"
-                        f"补充查询：{refined_query}\n\n"
-                        f"搜索结果：\n{context}"
-                    )
+                context = format_search_context(search_results)
 
-                    async for chunk in llm.astream([
-                        _system_msg(SUMMARIZER_PROMPT),
-                        HumanMessage(content=retry_prompt),
-                    ]):
-                        if chunk.content:
-                            summary += chunk.content
-                            await queue.put({
-                                "type": "task_summary_chunk",
-                                "task_id": task_id,
-                                "content": chunk.content,
-                            })
+                await queue.put({
+                    "type": "task_summary_clear",
+                    "task_id": task_id,
+                })
 
-                    logger.info(f"{tag} Summarizer (重试) 完成 → {len(summary)} chars")
+                logger.info(f"{tag} Summarizer Agent (retry {retry_round + 1}) | {task['title']!r}")
+
+                summary = ""
+                retry_prompt = (
+                    f"研究主题：{topic}\n"
+                    f"任务：{task['title']}\n"
+                    f"意图：{task['intent']}\n"
+                    f"搜索查询：{task['query']}\n"
+                    f"补充查询：{refined_query}\n\n"
+                    f"搜索结果：\n{context}"
+                )
+
+                async for chunk in llm.astream([
+                    _system_msg(SUMMARIZER_PROMPT),
+                    HumanMessage(content=retry_prompt),
+                ]):
+                    if chunk.content:
+                        summary += chunk.content
+                        await queue.put({
+                            "type": "task_summary_chunk",
+                            "task_id": task_id,
+                            "content": chunk.content,
+                        })
+
+                logger.info(f"{tag} Summarizer (retry {retry_round + 1}) → {len(summary)} chars")
 
             # ── Summarized ────────────────────────────────────────────
             await queue.put({
