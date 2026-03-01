@@ -15,14 +15,20 @@ from .prompts import EVALUATOR_PROMPT, PLANNER_PROMPT, REPORTER_PROMPT, SUMMARIZ
 from .search import format_search_context, perform_search
 
 
+_llm_instance: ChatOpenAI | None = None
+
+
 def get_llm() -> ChatOpenAI:
-    cfg = get_config()
-    return ChatOpenAI(
-        model=cfg.llm_model_id,
-        api_key=cfg.llm_api_key,
-        base_url=cfg.llm_base_url or None,
-        temperature=0.0,
-    )
+    global _llm_instance
+    if _llm_instance is None:
+        cfg = get_config()
+        _llm_instance = ChatOpenAI(
+            model=cfg.llm_model_id,
+            api_key=cfg.llm_api_key,
+            base_url=cfg.llm_base_url or None,
+            temperature=0.0,
+        )
+    return _llm_instance
 
 
 def _system_msg(prompt: str) -> SystemMessage:
@@ -69,6 +75,9 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
 
     logger.info(f"[Node: execute_all_tasks] 并行启动 {len(state['tasks'])} 个子任务 | search_api={search_api}")
 
+    # Limit concurrent searches to avoid rate limiting
+    search_semaphore = asyncio.Semaphore(2)
+
     async def _run_single_task(task: dict) -> dict:
         task_id = task["id"]
         tag = f"[Task #{task_id}]"
@@ -89,7 +98,8 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
                 "message": f"搜索中：{task['query']}",
                 "task_id": task_id,
             })
-            search_results, actual_provider = await perform_search(task["query"], search_api)
+            async with search_semaphore:
+                search_results, actual_provider = await perform_search(task["query"], search_api)
             logger.info(f"{tag} 搜索完成 → {len(search_results)} 条结果 via {actual_provider}")
 
             if actual_provider != search_api:
@@ -174,7 +184,8 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
                 })
 
                 logger.info(f"{tag} 补充搜索 | query={refined_query!r}")
-                new_results, _ = await perform_search(refined_query, search_api)
+                async with search_semaphore:
+                    new_results, _ = await perform_search(refined_query, search_api)
                 logger.info(f"{tag} 补充搜索完成 → {len(new_results)} 条结果")
                 search_results.extend(new_results)
 
