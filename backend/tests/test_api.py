@@ -82,3 +82,10 @@ async def test_delete_report_not_found(client):
 async def test_research_stream_empty_topic(client):
     resp = await client.post("/research/stream", json={"topic": "  "})
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_research_stream_topic_too_long(client):
+    resp = await client.post("/research/stream", json={"topic": "x" * 501})
+    assert resp.status_code == 400
+    assert "500" in resp.json()["detail"]

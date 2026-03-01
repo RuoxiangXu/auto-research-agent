@@ -46,8 +46,11 @@ class ResearchRequest(BaseModel):
 
 @app.post("/research/stream")
 async def research_stream(request: ResearchRequest):
-    if not request.topic.strip():
+    topic = request.topic.strip()
+    if not topic:
         raise HTTPException(status_code=400, detail="Topic is required")
+    if len(topic) > 500:
+        raise HTTPException(status_code=400, detail="Topic must be 500 characters or less")
 
     cfg = get_config()
     search_api = request.search_api or cfg.search_api
@@ -58,7 +61,7 @@ async def research_stream(request: ResearchRequest):
         try:
             result = await graph.ainvoke(
                 {
-                    "topic": request.topic,
+                    "topic": topic,
                     "search_api": search_api,
                     "tasks": [],
                     "completed_tasks": [],
@@ -72,7 +75,7 @@ async def research_stream(request: ResearchRequest):
 
             report_id = None
             if report:
-                report_id = await save_report(request.topic, report, completed)
+                report_id = await save_report(topic, report, completed)
 
             await queue.put({
                 "type": "final_report",

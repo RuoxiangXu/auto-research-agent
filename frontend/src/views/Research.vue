@@ -280,6 +280,7 @@ onBeforeUnmount(() => {
         class="topic-input"
         placeholder="输入你想深入研究的主题..."
         rows="3"
+        maxlength="500"
         @keydown.meta.enter="startResearch"
         @keydown.ctrl.enter="startResearch"
       />
