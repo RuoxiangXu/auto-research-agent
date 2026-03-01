@@ -2,6 +2,7 @@
 import { ref, onMounted, computed } from "vue";
 import { useRouter } from "vue-router";
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { fetchReports, fetchReport, deleteReport } from "../services/api";
 import type { ReportSummary, ReportDetail } from "../types";
 
@@ -14,7 +15,7 @@ const error = ref("");
 
 const renderedReport = computed(() => {
   if (!selectedReport.value) return "";
-  return marked(selectedReport.value.report_markdown) as string;
+  return DOMPurify.sanitize(marked(selectedReport.value.report_markdown) as string);
 });
 
 onMounted(async () => {

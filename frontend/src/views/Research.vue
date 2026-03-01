@@ -2,6 +2,7 @@
 import { ref, computed, nextTick, onBeforeUnmount } from "vue";
 import { useRouter } from "vue-router";
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { runResearchStream } from "../services/api";
 import type { TaskView, ActivityLog, SourceItem, SSEEvent } from "../types";
 
@@ -36,7 +37,7 @@ const selectedTask = computed(() =>
 
 const renderedReport = computed(() => {
   if (!reportMarkdown.value) return "";
-  return marked(reportMarkdown.value) as string;
+  return DOMPurify.sanitize(marked(reportMarkdown.value) as string);
 });
 
 // ── Activity logger ─────────────────────────────────────────────────────
