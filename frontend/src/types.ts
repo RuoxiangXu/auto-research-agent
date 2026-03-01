@@ -38,6 +38,7 @@ export type SSEEvent =
   | { type: "task_summary_clear"; task_id: number }
   | { type: "report_chunk"; content: string }
   | { type: "final_report"; report: string; report_id: string | null }
+  | { type: "langsmith_url"; url: string }
   | { type: "error"; detail: string }
   | { type: "done" };
 

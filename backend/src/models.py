@@ -11,6 +11,17 @@ class ResearchState(TypedDict):
     report: str
 
 
+class TaskState(TypedDict):
+    """State for the task execution subgraph (SearchAgent → SummarizerAgent → EvaluatorAgent)."""
+    task: dict
+    topic: str
+    search_api: str
+    search_results: list[dict]
+    summary: str
+    retry_count: int
+    refined_query: str
+
+
 class TaskResult(TypedDict):
     """Result of a single research task execution."""
     task_id: int

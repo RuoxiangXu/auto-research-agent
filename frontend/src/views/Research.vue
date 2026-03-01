@@ -18,6 +18,7 @@ const tasks = ref<TaskView[]>([]);
 const activityLogs = ref<ActivityLog[]>([]);
 const reportMarkdown = ref("");
 const reportId = ref<string | null>(null);
+const langsmithUrl = ref<string | null>(null);
 
 const selectedTaskId = ref<number | null>(null);
 let logCounter = 0;
@@ -69,11 +70,10 @@ function handleSSE(event: SSEEvent) {
     case "status":
       {
         let logType: ActivityLog["type"] = "info";
-        if (event.message.includes("搜索")) logType = "search";
-        else if (event.message.includes("总结")) logType = "summarize";
-        else if (event.message.includes("评估") || event.message.includes("纠错"))
-          logType = "evaluate";
-        else if (event.message.includes("报告")) logType = "report";
+        if (event.message.startsWith("SearchAgent:")) logType = "search";
+        else if (event.message.startsWith("SummarizerAgent:")) logType = "summarize";
+        else if (event.message.startsWith("EvaluatorAgent:")) logType = "evaluate";
+        else if (event.message.startsWith("ReporterAgent:")) logType = "report";
         addLog(event.message, logType, event.task_id);
       }
       break;
@@ -142,6 +142,10 @@ function handleSSE(event: SSEEvent) {
       addLog("研究报告生成完毕", "report");
       break;
 
+    case "langsmith_url":
+      langsmithUrl.value = event.url;
+      break;
+
     case "error":
       error.value = event.detail;
       addLog(`错误: ${event.detail}`, "error");
@@ -163,6 +167,7 @@ async function startResearch() {
   activityLogs.value = [];
   reportMarkdown.value = "";
   reportId.value = null;
+  langsmithUrl.value = null;
   selectedTaskId.value = null;
   logCounter = 0;
   phase.value = "researching";
@@ -198,6 +203,7 @@ function newResearch() {
   activityLogs.value = [];
   reportMarkdown.value = "";
   error.value = "";
+  langsmithUrl.value = null;
   selectedTaskId.value = null;
 }
 
@@ -318,6 +324,15 @@ onBeforeUnmount(() => {
           取消
         </button>
         <template v-else>
+          <a
+            v-if="langsmithUrl"
+            :href="langsmithUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="btn-ghost btn-trace"
+          >
+            View Trace
+          </a>
           <button class="btn-ghost" @click="router.push('/history')">历史</button>
           <button class="btn-ghost" @click="downloadReport" :disabled="!reportMarkdown">
             下载
@@ -1008,6 +1023,17 @@ onBeforeUnmount(() => {
   justify-content: center;
   height: 200px;
   color: var(--text-muted);
+}
+
+.btn-trace {
+  color: var(--accent) !important;
+  border-color: var(--accent) !important;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+.btn-trace:hover {
+  background: var(--accent-dim);
 }
 
 .error-banner {

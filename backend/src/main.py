@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -11,7 +13,7 @@ from pydantic import BaseModel
 
 from .config import get_config
 from .database import delete_report, get_report, get_reports, init_db, save_report
-from .graph import build_graph
+from .graph import get_graph
 from .search import close_mcp_session
 
 
@@ -41,6 +43,18 @@ class ResearchRequest(BaseModel):
     search_api: Optional[str] = None
 
 
+def _get_langsmith_url(run_id: str) -> str | None:
+    """Get LangSmith trace URL for a completed run."""
+    try:
+        from langsmith import Client
+        client = Client()
+        run = client.read_run(run_id)
+        return run.url
+    except Exception as e:
+        logger.debug(f"Could not get LangSmith URL: {e}")
+        return None
+
+
 # ── Research endpoints ───────────────────────────────────────────────────────
 
 
@@ -55,7 +69,10 @@ async def research_stream(request: ResearchRequest):
     cfg = get_config()
     search_api = request.search_api or cfg.search_api
     queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-    graph = build_graph()
+    graph = get_graph()
+
+    run_id = str(uuid.uuid4())
+    tracing_enabled = os.getenv("LANGCHAIN_TRACING_V2", "").lower() == "true"
 
     async def run_graph():
         try:
@@ -67,7 +84,10 @@ async def research_stream(request: ResearchRequest):
                     "completed_tasks": [],
                     "report": "",
                 },
-                config={"configurable": {"event_queue": queue}},
+                config={
+                    "configurable": {"event_queue": queue},
+                    "run_id": run_id,
+                },
             )
 
             report = result.get("report", "")
@@ -76,6 +96,12 @@ async def research_stream(request: ResearchRequest):
             report_id = None
             if report:
                 report_id = await save_report(topic, report, completed)
+
+            # Send LangSmith trace URL if tracing is enabled
+            if tracing_enabled:
+                trace_url = _get_langsmith_url(run_id)
+                if trace_url:
+                    await queue.put({"type": "langsmith_url", "url": trace_url})
 
             await queue.put({
                 "type": "final_report",

@@ -1,4 +1,3 @@
-import asyncio
 import json
 import re
 from datetime import date
@@ -7,10 +6,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 from loguru import logger
 
 from .config import get_config
-from .models import ResearchState
+from .models import ResearchState, TaskState
 from .prompts import EVALUATOR_PROMPT, PLANNER_PROMPT, REPORTER_PROMPT, SUMMARIZER_PROMPT
 from .search import format_search_context, perform_search
 
@@ -31,18 +31,211 @@ def _system_msg(prompt: str) -> SystemMessage:
     return SystemMessage(content=f"当前日期：{today}\n\n{prompt}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Task subgraph nodes: SearchAgent → SummarizerAgent → EvaluatorAgent
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-# ── Nodes ────────────────────────────────────────────────────────────────────
+async def search_node(state: TaskState, config: RunnableConfig) -> dict:
+    """SearchAgent: perform web search for the current task."""
+    queue = config["configurable"]["event_queue"]
+    task = state["task"]
+    task_id = task["id"]
+    search_api = state["search_api"]
+    is_retry = state["retry_count"] > 0
+
+    query = state["refined_query"] if is_retry else task["query"]
+    label = "补充搜索" if is_retry else "搜索"
+
+    await queue.put({
+        "type": "status",
+        "message": f"SearchAgent: {label} — {query}",
+        "task_id": task_id,
+    })
+
+    search_results, actual_provider = await perform_search(query, search_api)
+    logger.info(f"[Task #{task_id}] SearchAgent {label}完成 → {len(search_results)} 条结果 via {actual_provider}")
+
+    if actual_provider != search_api:
+        await queue.put({
+            "type": "status",
+            "message": f"SearchAgent: 回退 {search_api} → {actual_provider}",
+            "task_id": task_id,
+        })
+
+    # On retry, extend existing results; on first run, use new results directly
+    all_results = state["search_results"] + search_results if is_retry else search_results
+
+    await queue.put({
+        "type": "sources",
+        "task_id": task_id,
+        "sources": all_results,
+    })
+
+    return {"search_results": all_results}
+
+
+async def summarize_node(state: TaskState, config: RunnableConfig) -> dict:
+    """SummarizerAgent: generate a streaming summary from search results."""
+    queue = config["configurable"]["event_queue"]
+    task = state["task"]
+    task_id = task["id"]
+    is_retry = state["retry_count"] > 0
+
+    # Clear previous summary on retry
+    if is_retry:
+        await queue.put({"type": "task_summary_clear", "task_id": task_id})
+
+    label = "重新总结" if is_retry else "总结"
+    await queue.put({
+        "type": "status",
+        "message": f"SummarizerAgent: {label} — {task['title']}",
+        "task_id": task_id,
+    })
+
+    llm = get_llm()
+    context = format_search_context(state["search_results"])
+    prompt_parts = (
+        f"研究主题：{state['topic']}\n"
+        f"任务：{task['title']}\n"
+        f"意图：{task['intent']}\n"
+        f"搜索查询：{task['query']}\n"
+    )
+    if is_retry and state["refined_query"]:
+        prompt_parts += f"补充查询：{state['refined_query']}\n"
+    prompt_parts += f"\n搜索结果：\n{context}"
+
+    logger.info(f"[Task #{task_id}] SummarizerAgent {'(retry)' if is_retry else ''} | {task['title']!r}")
+
+    summary = ""
+    async for chunk in llm.astream([
+        _system_msg(SUMMARIZER_PROMPT),
+        HumanMessage(content=prompt_parts),
+    ]):
+        if chunk.content:
+            summary += chunk.content
+            await queue.put({
+                "type": "task_summary_chunk",
+                "task_id": task_id,
+                "content": chunk.content,
+            })
+
+    logger.info(f"[Task #{task_id}] SummarizerAgent 完成 → {len(summary)} chars")
+
+    return {"summary": summary}
+
+
+async def evaluate_node(state: TaskState, config: RunnableConfig) -> dict:
+    """EvaluatorAgent: assess summary quality and decide whether to retry."""
+    queue = config["configurable"]["event_queue"]
+    task = state["task"]
+    task_id = task["id"]
+
+    await queue.put({
+        "type": "status",
+        "message": f"EvaluatorAgent: 评估质量 — {task['title']}",
+        "task_id": task_id,
+    })
+
+    cfg = get_config()
+    logger.info(f"[Task #{task_id}] EvaluatorAgent (round {state['retry_count'] + 1}/{cfg.max_retry_count})")
+
+    llm = get_llm()
+    eval_user_msg = (
+        f"任务意图：{task['intent']}\n\n"
+        f"当前总结：\n{state['summary']}\n\n"
+        f"请评估这个总结的质量。"
+    )
+
+    eval_response = await llm.ainvoke([
+        _system_msg(EVALUATOR_PROMPT),
+        HumanMessage(content=eval_user_msg),
+    ])
+
+    needs_retry, refined_query = _parse_evaluation(eval_response.content)
+    logger.info(f"[Task #{task_id}] EvaluatorAgent → needs_retry={needs_retry}" + (f", refined_query={refined_query!r}" if refined_query else ""))
+
+    # Decide: retry if quality is low AND retries remain AND we have a refined query
+    should_retry = (
+        needs_retry
+        and refined_query
+        and state["retry_count"] < cfg.max_retry_count
+    )
+
+    if should_retry:
+        await queue.put({
+            "type": "status",
+            "message": f"EvaluatorAgent: 需要补充搜索 — {refined_query}",
+            "task_id": task_id,
+        })
+        return {
+            "refined_query": refined_query,
+            "retry_count": state["retry_count"] + 1,
+        }
+
+    # Quality is acceptable (or max retries reached) — mark task as summarized
+    await queue.put({
+        "type": "task_status",
+        "task_id": task_id,
+        "status": "summarized",
+        "title": task["title"],
+    })
+    logger.info(f"[Task #{task_id}] 任务完成 → summary={len(state['summary'])} chars, sources={len(state['search_results'])}")
+
+    # Clear refined_query so should_retry routes to END
+    return {"refined_query": ""}
+
+
+def should_retry(state: TaskState) -> str:
+    """Routing function: retry search or finish the task.
+
+    When evaluate_node decides to retry, it sets refined_query to a non-empty
+    string and increments retry_count. When it accepts the summary, it clears
+    refined_query to an empty string, so this function routes to END.
+    """
+    if state.get("refined_query"):
+        return "SearchAgent"
+    return END
+
+
+def _build_task_graph() -> StateGraph:
+    """Build the task execution subgraph.
+
+    Flow: SearchAgent → SummarizerAgent → EvaluatorAgent → [retry? → SearchAgent : END]
+    """
+    builder = StateGraph(TaskState)
+
+    builder.add_node("SearchAgent", search_node)
+    builder.add_node("SummarizerAgent", summarize_node)
+    builder.add_node("EvaluatorAgent", evaluate_node)
+
+    builder.add_edge(START, "SearchAgent")
+    builder.add_edge("SearchAgent", "SummarizerAgent")
+    builder.add_edge("SummarizerAgent", "EvaluatorAgent")
+    builder.add_conditional_edges("EvaluatorAgent", should_retry, {
+        "SearchAgent": "SearchAgent",
+        END: END,
+    })
+
+    return builder.compile()
+
+
+# Compile once and reuse
+_task_graph = _build_task_graph()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main graph nodes: PlannerAgent → [TaskSubgraph × N] → ReporterAgent
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 async def plan_node(state: ResearchState, config: RunnableConfig) -> dict:
-    """Decompose topic into research sub-tasks."""
+    """PlannerAgent: decompose topic into research sub-tasks."""
     queue = config["configurable"]["event_queue"]
     topic = state["topic"]
 
-    logger.info(f"[Node: plan] 正在执行 Planner Agent | 主题: {topic!r}")
-    await queue.put({"type": "status", "message": "正在规划研究任务..."})
+    logger.info(f"[PlannerAgent] 主题: {topic!r}")
+    await queue.put({"type": "status", "message": "PlannerAgent: 正在规划研究任务..."})
 
     llm = get_llm()
     user_msg = f"研究主题：{topic}\n\n请为这个主题规划3-5个研究子任务。"
@@ -53,7 +246,7 @@ async def plan_node(state: ResearchState, config: RunnableConfig) -> dict:
     ])
 
     tasks = _parse_tasks(response.content, topic)
-    logger.info(f"[Node: plan] Planner 完成 → 生成 {len(tasks)} 个子任务")
+    logger.info(f"[PlannerAgent] 完成 → 生成 {len(tasks)} 个子任务")
     for t in tasks:
         logger.info(f"  #{t['id']} {t['title']} (query: {t['query']!r})")
 
@@ -61,197 +254,66 @@ async def plan_node(state: ResearchState, config: RunnableConfig) -> dict:
     return {"tasks": tasks}
 
 
-async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dict:
-    """Execute ALL research tasks in parallel using asyncio.gather."""
+def route_to_tasks(state: ResearchState) -> list[Send]:
+    """Fan-out: create a parallel TaskSubgraph invocation for each planned task."""
+    return [
+        Send("TaskSubgraph", {
+            "task": task,
+            "topic": state["topic"],
+            "search_api": state.get("search_api", "duckduckgo"),
+            "search_results": [],
+            "summary": "",
+            "retry_count": 0,
+            "refined_query": "",
+        })
+        for task in state["tasks"]
+    ]
+
+
+async def task_subgraph(state: dict, config: RunnableConfig) -> dict:
+    """TaskSubgraph: invoke the task pipeline with error handling.
+
+    Receives per-task state from Send(), runs the SearchAgent → SummarizerAgent
+    → EvaluatorAgent pipeline, and returns the result for accumulation.
+    """
     queue = config["configurable"]["event_queue"]
-    topic = state["topic"]
-    search_api = state.get("search_api", "tavily")
+    task = state["task"]
+    task_id = task["id"]
 
-    logger.info(f"[Node: execute_all_tasks] 并行启动 {len(state['tasks'])} 个子任务 | search_api={search_api}")
+    try:
+        logger.info(f"[Task #{task_id}] 开始执行 | {task['title']!r}")
+        await queue.put({
+            "type": "task_status",
+            "task_id": task_id,
+            "status": "in_progress",
+            "title": task["title"],
+        })
 
-    # Limit concurrent searches to avoid rate limiting
-    search_semaphore = asyncio.Semaphore(2)
+        # Run the task subgraph
+        result = await _task_graph.ainvoke(state, config=config)
 
-    async def _run_single_task(task: dict) -> dict:
-        task_id = task["id"]
-        tag = f"[Task #{task_id}]"
-        try:
-            logger.info(f"{tag} 开始执行 | {task['title']!r}")
-
-            # ── in_progress ──────────────────────────────────────────
-            await queue.put({
-                "type": "task_status",
-                "task_id": task_id,
-                "status": "in_progress",
-                "title": task["title"],
-            })
-
-            # ── Search ───────────────────────────────────────────────
-            await queue.put({
-                "type": "status",
-                "message": f"搜索中：{task['query']}",
-                "task_id": task_id,
-            })
-            async with search_semaphore:
-                search_results, actual_provider = await perform_search(task["query"], search_api)
-            logger.info(f"{tag} 搜索完成 → {len(search_results)} 条结果 via {actual_provider}")
-
-            if actual_provider != search_api:
-                await queue.put({
-                    "type": "status",
-                    "message": f"搜索回退：{search_api} → {actual_provider}",
-                    "task_id": task_id,
-                })
-
-            await queue.put({
-                "type": "sources",
-                "task_id": task_id,
-                "sources": search_results,
-            })
-
-            # ── Summarise (streaming) ────────────────────────────────
-            await queue.put({
-                "type": "status",
-                "message": f"正在总结：{task['title']}",
-                "task_id": task_id,
-            })
-
-            llm = get_llm()
-            context = format_search_context(search_results)
-            summary_prompt = (
-                f"研究主题：{topic}\n"
-                f"任务：{task['title']}\n"
-                f"意图：{task['intent']}\n"
-                f"搜索查询：{task['query']}\n\n"
-                f"搜索结果：\n{context}"
-            )
-
-            logger.info(f"{tag} 正在执行 Summarizer Agent | {task['title']!r}")
-
-            summary = ""
-            async for chunk in llm.astream([
-                _system_msg(SUMMARIZER_PROMPT),
-                HumanMessage(content=summary_prompt),
-            ]):
-                if chunk.content:
-                    summary += chunk.content
-                    await queue.put({
-                        "type": "task_summary_chunk",
-                        "task_id": task_id,
-                        "content": chunk.content,
-                    })
-
-            logger.info(f"{tag} Summarizer 完成 → {len(summary)} chars")
-
-            # ── Self-correction loop ───────────────────────────────────
-            cfg = get_config()
-            for retry_round in range(cfg.max_retry_count):
-                await queue.put({
-                    "type": "status",
-                    "message": f"评估质量：{task['title']}",
-                    "task_id": task_id,
-                })
-
-                logger.info(f"{tag} Evaluator Agent (round {retry_round + 1}/{cfg.max_retry_count})")
-
-                eval_user_msg = (
-                    f"任务意图：{task['intent']}\n\n"
-                    f"当前总结：\n{summary}\n\n"
-                    f"请评估这个总结的质量。"
-                )
-
-                eval_response = await llm.ainvoke([
-                    _system_msg(EVALUATOR_PROMPT),
-                    HumanMessage(content=eval_user_msg),
-                ])
-
-                needs_retry, refined_query = _parse_evaluation(eval_response.content)
-                logger.info(f"{tag} Evaluator → needs_retry={needs_retry}" + (f", refined_query={refined_query!r}" if refined_query else ""))
-
-                if not needs_retry or not refined_query:
-                    break
-
-                await queue.put({
-                    "type": "status",
-                    "message": f"自纠错 ({retry_round + 1}/{cfg.max_retry_count})：补充搜索 — {refined_query}",
-                    "task_id": task_id,
-                })
-
-                logger.info(f"{tag} 补充搜索 | query={refined_query!r}")
-                async with search_semaphore:
-                    new_results, _ = await perform_search(refined_query, search_api)
-                logger.info(f"{tag} 补充搜索完成 → {len(new_results)} 条结果")
-                search_results.extend(new_results)
-
-                # Push updated sources to frontend
-                await queue.put({
-                    "type": "sources",
-                    "task_id": task_id,
-                    "sources": search_results,
-                })
-
-                context = format_search_context(search_results)
-
-                await queue.put({
-                    "type": "task_summary_clear",
-                    "task_id": task_id,
-                })
-
-                logger.info(f"{tag} Summarizer Agent (retry {retry_round + 1}) | {task['title']!r}")
-
-                summary = ""
-                retry_prompt = (
-                    f"研究主题：{topic}\n"
-                    f"任务：{task['title']}\n"
-                    f"意图：{task['intent']}\n"
-                    f"搜索查询：{task['query']}\n"
-                    f"补充查询：{refined_query}\n\n"
-                    f"搜索结果：\n{context}"
-                )
-
-                async for chunk in llm.astream([
-                    _system_msg(SUMMARIZER_PROMPT),
-                    HumanMessage(content=retry_prompt),
-                ]):
-                    if chunk.content:
-                        summary += chunk.content
-                        await queue.put({
-                            "type": "task_summary_chunk",
-                            "task_id": task_id,
-                            "content": chunk.content,
-                        })
-
-                logger.info(f"{tag} Summarizer (retry {retry_round + 1}) → {len(summary)} chars")
-
-            # ── Summarized ────────────────────────────────────────────
-            await queue.put({
-                "type": "task_status",
-                "task_id": task_id,
-                "status": "summarized",
-                "title": task["title"],
-            })
-
-            logger.info(f"{tag} 任务完成 → summary={len(summary)} chars, sources={len(search_results)}")
-
-            return {
+        return {
+            "completed_tasks": [{
                 "task_id": task_id,
                 "title": task["title"],
                 "intent": task["intent"],
                 "query": task["query"],
-                "summary": summary,
-                "sources": search_results,
+                "summary": result["summary"],
+                "sources": result["search_results"],
                 "status": "summarized",
-            }
+            }],
+        }
 
-        except Exception as e:
-            logger.error(f"{tag} 执行失败: {e}")
-            await queue.put({
-                "type": "task_status",
-                "task_id": task_id,
-                "status": "failed",
-                "title": task.get("title", ""),
-            })
-            return {
+    except Exception as e:
+        logger.error(f"[Task #{task_id}] 执行失败: {e}")
+        await queue.put({
+            "type": "task_status",
+            "task_id": task_id,
+            "status": "failed",
+            "title": task.get("title", ""),
+        })
+        return {
+            "completed_tasks": [{
                 "task_id": task_id,
                 "title": task.get("title", ""),
                 "intent": task.get("intent", ""),
@@ -259,24 +321,16 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
                 "summary": f"任务执行失败：{e}",
                 "sources": [],
                 "status": "failed",
-            }
-
-    # Run every task concurrently; gather waits for ALL to finish
-    results = await asyncio.gather(
-        *[_run_single_task(t) for t in state["tasks"]]
-    )
-
-    logger.info(f"[Node: execute_all_tasks] 全部 {len(results)} 个子任务完成 | " + ", ".join(f"#{r['task_id']}={r['status']}" for r in results))
-
-    return {"completed_tasks": list(results)}
+            }],
+        }
 
 
 async def report_node(state: ResearchState, config: RunnableConfig) -> dict:
-    """Synthesise all task results into a final report."""
+    """ReporterAgent: synthesise all task results into a final report."""
     queue = config["configurable"]["event_queue"]
 
-    logger.info(f"[Node: report] 正在执行 Reporter Agent | 生成最终报告")
-    await queue.put({"type": "status", "message": "正在生成研究报告..."})
+    logger.info(f"[ReporterAgent] 生成最终报告")
+    await queue.put({"type": "status", "message": "ReporterAgent: 正在生成研究报告..."})
 
     llm = get_llm()
 
@@ -284,9 +338,8 @@ async def report_node(state: ResearchState, config: RunnableConfig) -> dict:
     global_sources, task_source_maps = _build_source_maps(state["completed_tasks"])
 
     raw_count = sum(len(t.get("sources", [])) for t in state["completed_tasks"])
-    logger.info(f"[Node: report] 来源去重: {raw_count} → {len(global_sources)} 条")
+    logger.info(f"[ReporterAgent] 来源去重: {raw_count} → {len(global_sources)} 条")
 
-    # Build the numbered reference block for the LLM
     source_ref_lines = []
     for i, src in enumerate(global_sources, 1):
         if src["url"]:
@@ -317,16 +370,24 @@ async def report_node(state: ResearchState, config: RunnableConfig) -> dict:
         f"在报告末尾的参考来源章节中，列出上述编号对应的来源。"
     )
 
+    messages = [_system_msg(REPORTER_PROMPT), HumanMessage(content=user_msg)]
+
     report = ""
-    async for chunk in llm.astream([
-        _system_msg(REPORTER_PROMPT),
-        HumanMessage(content=user_msg),
-    ]):
+    async for chunk in llm.astream(messages):
         if chunk.content:
             report += chunk.content
             await queue.put({"type": "report_chunk", "content": chunk.content})
 
-    # Now that the report is done, mark all tasks as truly "completed"
+    # Fallback: if streaming returned empty (known issue after burst concurrent
+    # LLM calls), retry with a non-streaming ainvoke call.
+    if not report:
+        logger.warning("[ReporterAgent] astream returned empty, falling back to ainvoke")
+        response = await llm.ainvoke(messages)
+        report = response.content or ""
+        if report:
+            await queue.put({"type": "report_chunk", "content": report})
+
+    # Mark all tasks as truly "completed"
     for t in state["completed_tasks"]:
         await queue.put({
             "type": "task_status",
@@ -335,47 +396,62 @@ async def report_node(state: ResearchState, config: RunnableConfig) -> dict:
             "title": t["title"],
         })
 
-    logger.info(f"[Node: report] Reporter 完成 → {len(report)} chars, 全部任务标记为 completed")
+    logger.info(f"[ReporterAgent] 完成 → {len(report)} chars")
 
     return {"report": report}
 
 
-# ── Graph builder ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Graph builder
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def build_graph():
     """Construct and compile the research LangGraph.
 
-    Flow: START → plan → execute_all_tasks → report → END
-    Parallelism is handled inside execute_all_tasks via asyncio.gather,
-    which guarantees report only starts after every task finishes.
+    Main graph flow:
+        START → PlannerAgent → [TaskSubgraph × N via Send] → ReporterAgent → END
+
+    Each TaskSubgraph runs an inner pipeline:
+        SearchAgent → SummarizerAgent → EvaluatorAgent → [retry? → SearchAgent : END]
+
+    Parallelism is handled natively by LangGraph's Send() API for fan-out.
+    The operator.add reducer on completed_tasks handles fan-in accumulation.
     """
     builder = StateGraph(ResearchState)
 
-    builder.add_node("plan", plan_node)
-    builder.add_node("execute_all_tasks", execute_all_tasks)
-    builder.add_node("report", report_node)
+    builder.add_node("PlannerAgent", plan_node)
+    builder.add_node("TaskSubgraph", task_subgraph)
+    builder.add_node("ReporterAgent", report_node)
 
-    builder.add_edge(START, "plan")
-    builder.add_edge("plan", "execute_all_tasks")
-    builder.add_edge("execute_all_tasks", "report")
-    builder.add_edge("report", END)
+    builder.add_edge(START, "PlannerAgent")
+    builder.add_conditional_edges("PlannerAgent", route_to_tasks, ["TaskSubgraph"])
+    builder.add_edge("TaskSubgraph", "ReporterAgent")
+    builder.add_edge("ReporterAgent", END)
 
     return builder.compile()
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+_main_graph = None
+
+
+def get_graph():
+    """Return a cached compiled research graph (compile once, reuse across requests)."""
+    global _main_graph
+    if _main_graph is None:
+        _main_graph = build_graph()
+    return _main_graph
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def _build_source_maps(
     completed_tasks: list[dict],
 ) -> tuple[list[dict], dict[int, dict[int, int]]]:
-    """Build deduplicated global source list and per-task citation mappings.
-
-    Returns (global_sources, task_source_maps) where:
-      - global_sources: [{title, url}, ...] with 1-based indexing
-      - task_source_maps: {task_id: {local_idx: global_idx}}
-    """
+    """Build deduplicated global source list and per-task citation mappings."""
     global_sources: list[dict] = []
     seen_keys: dict[str, int] = {}
     task_source_maps: dict[int, dict[int, int]] = {}
@@ -388,10 +464,10 @@ def _build_source_maps(
             url = s.get("url", "").strip()
             if not title and not url:
                 continue
-            key = url or title  # prefer URL for dedup
+            key = url or title
             if key not in seen_keys:
                 global_sources.append({"title": title or url, "url": url})
-                seen_keys[key] = len(global_sources)  # 1-based
+                seen_keys[key] = len(global_sources)
             local_map[local_idx] = seen_keys[key]
         task_source_maps[tid] = local_map
 
@@ -399,11 +475,7 @@ def _build_source_maps(
 
 
 def _remap_citations(summary: str, local_map: dict[int, int]) -> str:
-    """Replace local [N] references with global [M] references.
-
-    Only matches [N] where N exists in local_map, avoiding false positives
-    on year-like patterns such as [2024] or large numbers.
-    """
+    """Replace local [N] references with global [M] references."""
     if not local_map:
         return summary
 
@@ -456,14 +528,12 @@ def _parse_tasks(content: str, topic: str = "") -> list[dict]:
     try:
         raw_tasks = None
 
-        # Try object with "tasks" key first
         obj_str = _extract_json(content, "{", "}")
         if obj_str:
             data = json.loads(obj_str)
             if isinstance(data, dict) and "tasks" in data:
                 raw_tasks = data["tasks"]
 
-        # Fall back to bare array
         if raw_tasks is None:
             arr_str = _extract_json(content, "[", "]")
             if arr_str:
@@ -482,7 +552,7 @@ def _parse_tasks(content: str, topic: str = "") -> list[dict]:
             for i, t in enumerate(raw_tasks)
         ]
     except Exception as e:
-        logger.warning(f"[Plan] Failed to parse tasks: {e}, creating fallback")
+        logger.warning(f"[PlannerAgent] Failed to parse tasks: {e}, creating fallback")
         return [
             {
                 "id": 1,
