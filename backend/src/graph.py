@@ -58,7 +58,7 @@ async def plan_node(state: ResearchState, config: RunnableConfig) -> dict:
         HumanMessage(content=user_msg),
     ])
 
-    tasks = _parse_tasks(response.content)
+    tasks = _parse_tasks(response.content, topic)
     logger.info(f"[Node: plan] Planner 完成 → 生成 {len(tasks)} 个子任务")
     for t in tasks:
         logger.info(f"  #{t['id']} {t['title']} (query: {t['query']!r})")
@@ -457,7 +457,7 @@ def _extract_json(content: str, open_char: str = "{", close_char: str = "}") -> 
     return None
 
 
-def _parse_tasks(content: str) -> list[dict]:
+def _parse_tasks(content: str, topic: str = "") -> list[dict]:
     """Extract planned tasks from LLM JSON response."""
     try:
         raw_tasks = None
@@ -494,7 +494,7 @@ def _parse_tasks(content: str) -> list[dict]:
                 "id": 1,
                 "title": "基础背景研究",
                 "intent": "了解主题的基本背景和核心概念",
-                "query": content[:100] if content else "基础研究",
+                "query": topic if topic else "基础研究",
             }
         ]
 

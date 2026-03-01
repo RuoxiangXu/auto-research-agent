@@ -55,10 +55,11 @@ class TestParseTasks:
 
     def test_invalid_json_returns_fallback_task(self):
         content = "This is not JSON at all"
-        result = _parse_tasks(content)
+        result = _parse_tasks(content, topic="AI research")
         assert len(result) == 1
         assert result[0]["id"] == 1
         assert result[0]["title"] == "基础背景研究"
+        assert result[0]["query"] == "AI research"
 
     def test_empty_content_returns_fallback(self):
         result = _parse_tasks("")
