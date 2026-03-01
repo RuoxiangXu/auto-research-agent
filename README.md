@@ -2,16 +2,13 @@
 
 AI-powered deep research assistant built with LangGraph. Given a research topic, it automatically plans sub-tasks, searches the web in parallel, summarizes findings with self-correction, and generates a structured report with proper citations.
 
-<table>
-  <tr>
-    <td><img src="images/index.png" alt="Landing Page" width="500"/></td>
-    <td><img src="images/result.png" alt="Research Result" width="500"/></td>
-  </tr>
-  <tr>
-    <td><img src="images/history.png" alt="Report History" width="500"/></td>
-    <td><img src="images/LangSmith.png" alt="LangSmith Trace" width="500"/></td>
-  </tr>
-</table>
+![Landing Page](images/index.png)
+
+![Research Result](images/result.png)
+
+![Report History](images/history.png)
+
+![LangSmith Trace](images/LangSmith.png)
 
 ## Architecture
 
