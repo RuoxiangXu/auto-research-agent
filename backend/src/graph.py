@@ -399,19 +399,56 @@ def _remap_citations(summary: str, local_map: dict[int, int]) -> str:
     return re.sub(r'\[(\d+)\]', _replace, summary)
 
 
+def _extract_json(content: str, open_char: str = "{", close_char: str = "}") -> str | None:
+    """Extract the first balanced JSON object/array from content."""
+    start = content.find(open_char)
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(content)):
+        c = content[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return content[start : i + 1]
+    return None
+
+
 def _parse_tasks(content: str) -> list[dict]:
     """Extract planned tasks from LLM JSON response."""
     try:
-        match = re.search(r"\{.*\"tasks\".*\}", content, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            raw_tasks = data.get("tasks", [])
-        else:
-            arr_match = re.search(r"\[.*\]", content, re.DOTALL)
-            if arr_match:
-                raw_tasks = json.loads(arr_match.group())
-            else:
-                raise ValueError("no json found")
+        raw_tasks = None
+
+        # Try object with "tasks" key first
+        obj_str = _extract_json(content, "{", "}")
+        if obj_str:
+            data = json.loads(obj_str)
+            if isinstance(data, dict) and "tasks" in data:
+                raw_tasks = data["tasks"]
+
+        # Fall back to bare array
+        if raw_tasks is None:
+            arr_str = _extract_json(content, "[", "]")
+            if arr_str:
+                raw_tasks = json.loads(arr_str)
+
+        if raw_tasks is None:
+            raise ValueError("no json found")
 
         return [
             {
@@ -437,9 +474,9 @@ def _parse_tasks(content: str) -> list[dict]:
 def _parse_evaluation(content: str) -> tuple[bool, str | None]:
     """Extract evaluation result from LLM JSON response."""
     try:
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
+        obj_str = _extract_json(content, "{", "}")
+        if obj_str:
+            data = json.loads(obj_str)
             return data.get("needs_retry", False), data.get("refined_query") or None
     except Exception:
         pass

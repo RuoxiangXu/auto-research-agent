@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.graph import _parse_tasks, _parse_evaluation, _build_source_maps, _remap_citations
+from src.graph import _parse_tasks, _parse_evaluation, _build_source_maps, _remap_citations, _extract_json
 
 
 class TestParseTasks:
@@ -109,6 +109,41 @@ class TestParseEvaluation:
         content = '{"quality_score": 7}'
         needs_retry, query = _parse_evaluation(content)
         assert needs_retry is False
+
+
+class TestExtractJson:
+    """Tests for _extract_json — balanced brace extraction."""
+
+    def test_simple_object(self):
+        assert _extract_json('{"a": 1}') == '{"a": 1}'
+
+    def test_nested_object(self):
+        text = '{"tasks": [{"title": "T"}]}'
+        assert _extract_json(text) == text
+
+    def test_with_surrounding_text(self):
+        text = 'Here: {"a": 1} and more'
+        assert _extract_json(text) == '{"a": 1}'
+
+    def test_multiple_objects_returns_first(self):
+        text = '{"first": 1} {"second": 2}'
+        assert _extract_json(text) == '{"first": 1}'
+
+    def test_array_extraction(self):
+        text = 'Result: [1, 2, 3] done'
+        assert _extract_json(text, "[", "]") == '[1, 2, 3]'
+
+    def test_strings_with_braces(self):
+        text = '{"key": "value with } brace"}'
+        assert _extract_json(text) == '{"key": "value with } brace"}'
+
+    def test_no_json_returns_none(self):
+        assert _extract_json("no json here") is None
+
+    def test_escaped_quotes_in_string(self):
+        text = r'{"key": "val\"ue"}'
+        result = _extract_json(text)
+        assert result is not None
 
 
 class TestBuildSourceMaps:
