@@ -259,26 +259,7 @@ async def report_node(state: ResearchState, config: RunnableConfig) -> dict:
     llm = get_llm()
 
     # ── Step 1: Build global deduplicated & numbered source list ─────
-    global_sources: list[dict] = []       # [{title, url}, ...]
-    seen_titles: dict[str, int] = {}      # title -> 1-based global index
-
-    # Per-task local-to-global mapping: task_id -> {local_idx -> global_idx}
-    task_source_maps: dict[int, dict[int, int]] = {}
-
-    for t in state["completed_tasks"]:
-        tid = t["task_id"]
-        local_map: dict[int, int] = {}
-        for local_idx, s in enumerate(t.get("sources", []), 1):
-            title = s.get("title", "").strip()
-            url = s.get("url", "").strip()
-            if not title and not url:
-                continue
-            key = title or url
-            if key not in seen_titles:
-                global_sources.append({"title": title or url, "url": url})
-                seen_titles[key] = len(global_sources)  # 1-based
-            local_map[local_idx] = seen_titles[key]
-        task_source_maps[tid] = local_map
+    global_sources, task_source_maps = _build_source_maps(state["completed_tasks"])
 
     raw_count = sum(len(t.get("sources", [])) for t in state["completed_tasks"])
     logger.info(f"[Node: report] 来源去重: {raw_count} → {len(global_sources)} 条")
@@ -292,20 +273,7 @@ async def report_node(state: ResearchState, config: RunnableConfig) -> dict:
             source_ref_lines.append(f"[{i}] {src['title']}")
     source_ref_block = "\n".join(source_ref_lines) if source_ref_lines else "（无来源）"
 
-    # ── Step 2: Remap [N] citations in each task summary ────────────
-    def _remap_citations(summary: str, local_map: dict[int, int]) -> str:
-        """Replace local [N] references with global [M] references."""
-        if not local_map:
-            return summary
-        def _replace(m):
-            local_id = int(m.group(1))
-            global_id = local_map.get(local_id)
-            if global_id is not None:
-                return f"[{global_id}]"
-            return m.group(0)
-        return re.sub(r'\[(\d+)\]', _replace, summary)
-
-    # ── Step 3: Build per-task context with remapped summaries ──────
+    # ── Step 2: Build per-task context with remapped summaries ──────
     tasks_context = ""
     for t in state["completed_tasks"]:
         tid = t["task_id"]
@@ -375,6 +343,52 @@ def build_graph():
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _build_source_maps(
+    completed_tasks: list[dict],
+) -> tuple[list[dict], dict[int, dict[int, int]]]:
+    """Build deduplicated global source list and per-task citation mappings.
+
+    Returns (global_sources, task_source_maps) where:
+      - global_sources: [{title, url}, ...] with 1-based indexing
+      - task_source_maps: {task_id: {local_idx: global_idx}}
+    """
+    global_sources: list[dict] = []
+    seen_keys: dict[str, int] = {}
+    task_source_maps: dict[int, dict[int, int]] = {}
+
+    for t in completed_tasks:
+        tid = t["task_id"]
+        local_map: dict[int, int] = {}
+        for local_idx, s in enumerate(t.get("sources", []), 1):
+            title = s.get("title", "").strip()
+            url = s.get("url", "").strip()
+            if not title and not url:
+                continue
+            key = url or title  # prefer URL for dedup
+            if key not in seen_keys:
+                global_sources.append({"title": title or url, "url": url})
+                seen_keys[key] = len(global_sources)  # 1-based
+            local_map[local_idx] = seen_keys[key]
+        task_source_maps[tid] = local_map
+
+    return global_sources, task_source_maps
+
+
+def _remap_citations(summary: str, local_map: dict[int, int]) -> str:
+    """Replace local [N] references with global [M] references."""
+    if not local_map:
+        return summary
+
+    def _replace(m):
+        local_id = int(m.group(1))
+        global_id = local_map.get(local_id)
+        if global_id is not None:
+            return f"[{global_id}]"
+        return m.group(0)
+
+    return re.sub(r'\[(\d+)\]', _replace, summary)
 
 
 def _parse_tasks(content: str) -> list[dict]:

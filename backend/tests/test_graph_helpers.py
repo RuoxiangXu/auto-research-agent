@@ -1,8 +1,8 @@
-"""Tests for graph.py helper functions: _parse_tasks, _parse_evaluation, _remap_citations."""
+"""Tests for graph.py helper functions."""
 
 import pytest
 
-from src.graph import _parse_tasks, _parse_evaluation
+from src.graph import _parse_tasks, _parse_evaluation, _build_source_maps, _remap_citations
 
 
 class TestParseTasks:
@@ -109,3 +109,74 @@ class TestParseEvaluation:
         content = '{"quality_score": 7}'
         needs_retry, query = _parse_evaluation(content)
         assert needs_retry is False
+
+
+class TestBuildSourceMaps:
+    """Tests for _build_source_maps — deduplication and index mapping."""
+
+    def test_basic_dedup(self):
+        tasks = [
+            {"task_id": 1, "sources": [
+                {"title": "A", "url": "https://a.com"},
+                {"title": "B", "url": "https://b.com"},
+            ]},
+            {"task_id": 2, "sources": [
+                {"title": "A", "url": "https://a.com"},  # duplicate URL
+                {"title": "C", "url": "https://c.com"},
+            ]},
+        ]
+        sources, maps = _build_source_maps(tasks)
+        assert len(sources) == 3  # a, b, c
+        # task 1: local 1->global 1, local 2->global 2
+        assert maps[1] == {1: 1, 2: 2}
+        # task 2: local 1->global 1 (deduped), local 2->global 3
+        assert maps[2] == {1: 1, 2: 3}
+
+    def test_dedup_prefers_url_over_title(self):
+        """Same title, different URLs should NOT be deduped."""
+        tasks = [{"task_id": 1, "sources": [
+            {"title": "Same Title", "url": "https://a.com"},
+            {"title": "Same Title", "url": "https://b.com"},
+        ]}]
+        sources, maps = _build_source_maps(tasks)
+        assert len(sources) == 2
+
+    def test_dedup_same_url_different_titles(self):
+        """Same URL, different titles should be deduped."""
+        tasks = [{"task_id": 1, "sources": [
+            {"title": "Title A", "url": "https://same.com"},
+            {"title": "Title B", "url": "https://same.com"},
+        ]}]
+        sources, maps = _build_source_maps(tasks)
+        assert len(sources) == 1
+
+    def test_empty_title_and_url_skipped(self):
+        tasks = [{"task_id": 1, "sources": [
+            {"title": "", "url": ""},
+            {"title": "Valid", "url": "https://valid.com"},
+        ]}]
+        sources, maps = _build_source_maps(tasks)
+        assert len(sources) == 1
+        assert maps[1] == {2: 1}  # first source skipped, second is local idx 2
+
+    def test_no_sources(self):
+        tasks = [{"task_id": 1, "sources": []}]
+        sources, maps = _build_source_maps(tasks)
+        assert sources == []
+        assert maps[1] == {}
+
+
+class TestRemapCitations:
+    """Tests for _remap_citations."""
+
+    def test_basic_remap(self):
+        result = _remap_citations("See [1] and [2].", {1: 5, 2: 10})
+        assert result == "See [5] and [10]."
+
+    def test_unmapped_ids_preserved(self):
+        result = _remap_citations("See [1] and [99].", {1: 5})
+        assert result == "See [5] and [99]."
+
+    def test_empty_map_returns_unchanged(self):
+        text = "No citations [1] here [2]."
+        assert _remap_citations(text, {}) == text
