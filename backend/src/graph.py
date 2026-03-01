@@ -377,12 +377,20 @@ def _build_source_maps(
 
 
 def _remap_citations(summary: str, local_map: dict[int, int]) -> str:
-    """Replace local [N] references with global [M] references."""
+    """Replace local [N] references with global [M] references.
+
+    Only matches [N] where N exists in local_map, avoiding false positives
+    on year-like patterns such as [2024] or large numbers.
+    """
     if not local_map:
         return summary
 
+    max_local = max(local_map.keys())
+
     def _replace(m):
         local_id = int(m.group(1))
+        if local_id > max_local:
+            return m.group(0)
         global_id = local_map.get(local_id)
         if global_id is not None:
             return f"[{global_id}]"

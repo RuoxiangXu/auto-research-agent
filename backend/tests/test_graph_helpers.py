@@ -180,3 +180,12 @@ class TestRemapCitations:
     def test_empty_map_returns_unchanged(self):
         text = "No citations [1] here [2]."
         assert _remap_citations(text, {}) == text
+
+    def test_large_numbers_not_remapped(self):
+        """Year-like patterns [2024] should not be touched."""
+        result = _remap_citations("In [2024], see [1] for details.", {1: 3})
+        assert result == "In [2024], see [3] for details."
+
+    def test_mixed_valid_and_large(self):
+        result = _remap_citations("[1][2][100]", {1: 10, 2: 20})
+        assert result == "[10][20][100]"
