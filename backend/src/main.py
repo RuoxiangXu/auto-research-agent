@@ -49,7 +49,7 @@ async def research_stream(request: ResearchRequest):
 
     cfg = get_config()
     search_api = request.search_api or cfg.search_api
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
     graph = build_graph()
 
     async def run_graph():
@@ -89,7 +89,7 @@ async def research_stream(request: ResearchRequest):
             while True:
                 event = await queue.get()
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event.get("type") in ("done", "error"):
+                if event.get("type") == "done":
                     break
         except asyncio.CancelledError:
             task.cancel()
