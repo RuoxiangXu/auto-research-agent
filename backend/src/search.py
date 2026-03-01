@@ -1,31 +1,101 @@
 import asyncio
 import json
 import os
+import re
 
 from loguru import logger
 
 from .config import get_config
 
 
-async def perform_search(query: str, search_api: str = "tavily") -> list[dict]:
-    """Perform web search using the configured provider."""
+# ── MCP session cache ────────────────────────────────────────────────────────
+
+_mcp_session = None
+_mcp_streams = None
+_mcp_cm = None
+_mcp_session_cm = None
+_mcp_lock = asyncio.Lock()
+
+
+async def _get_mcp_session():
+    """Get or create a cached MCP client session."""
+    global _mcp_session, _mcp_streams, _mcp_cm, _mcp_session_cm
+
+    if _mcp_session is not None:
+        return _mcp_session
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    config = get_config()
+    full_env = {**os.environ, **config.mcp_server_env}
+
+    server_params = StdioServerParameters(
+        command=config.mcp_server_command,
+        args=config.mcp_server_args,
+        env=full_env,
+    )
+
+    _mcp_cm = stdio_client(server_params)
+    _mcp_streams = await _mcp_cm.__aenter__()
+    _mcp_session_cm = ClientSession(*_mcp_streams)
+    _mcp_session = await _mcp_session_cm.__aenter__()
+    await _mcp_session.initialize()
+
+    return _mcp_session
+
+
+async def close_mcp_session():
+    """Close the cached MCP session if open."""
+    global _mcp_session, _mcp_streams, _mcp_cm, _mcp_session_cm
+
+    if _mcp_session_cm is not None:
+        try:
+            await _mcp_session_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+    if _mcp_cm is not None:
+        try:
+            await _mcp_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    _mcp_session = None
+    _mcp_streams = None
+    _mcp_cm = None
+    _mcp_session_cm = None
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
+
+async def perform_search(
+    query: str, search_api: str = "tavily"
+) -> tuple[list[dict], str]:
+    """Perform web search using the configured provider.
+
+    Returns (results, actual_provider) where actual_provider may differ
+    from search_api if a fallback occurred.
+    """
     config = get_config()
     max_results = config.max_search_results
+    actual_provider = search_api
 
     if search_api == "tavily":
         results = await _search_tavily(query, config.tavily_api_key, max_results)
     elif search_api == "mcp":
-        results = await _search_mcp(query)
+        results, actual_provider = await _search_mcp(query)
     else:
         results = await _search_duckduckgo(query, max_results)
+        actual_provider = "duckduckgo"
 
     if results:
         titles = [r.get("title", "N/A")[:40] for r in results]
-        logger.info(f"[Search] query={query!r} → {len(results)} 条结果: {titles}")
+        logger.info(f"[Search] query={query!r} → {len(results)} results via {actual_provider}: {titles}")
     else:
-        logger.warning(f"[Search] query={query!r} → 无结果")
+        logger.warning(f"[Search] query={query!r} → no results via {actual_provider}")
 
-    return results
+    return results, actual_provider
 
 
 async def _search_tavily(query: str, api_key: str, max_results: int = 5) -> list[dict]:
@@ -77,85 +147,70 @@ async def _search_duckduckgo(query: str, max_results: int = 5) -> list[dict]:
         return []
 
 
-async def _search_mcp(query: str) -> list[dict]:
-    """Search using an MCP server."""
+async def _search_mcp(query: str) -> tuple[list[dict], str]:
+    """Search using an MCP server. Returns (results, actual_provider)."""
     config = get_config()
 
     if not config.mcp_server_command:
         logger.warning("[Search] MCP not configured, falling back to DuckDuckGo")
-        return await _search_duckduckgo(query)
+        results = await _search_duckduckgo(query)
+        return results, "duckduckgo"
 
     try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        async with _mcp_lock:
+            session = await _get_mcp_session()
 
-        full_env = {**os.environ, **config.mcp_server_env}
+        tools = await session.list_tools()
+        tool_names = [t.name for t in tools.tools]
 
-        server_params = StdioServerParameters(
-            command=config.mcp_server_command,
-            args=config.mcp_server_args,
-            env=full_env,
+        tool_name = config.mcp_tool_name
+        if tool_name not in tool_names and tool_names:
+            logger.warning(
+                f"[Search] MCP tool '{tool_name}' not found, "
+                f"using '{tool_names[0]}' instead"
+            )
+            tool_name = tool_names[0]
+
+        result = await session.call_tool(
+            tool_name,
+            {"query": query},
         )
 
-        async with stdio_client(server_params) as streams:
-            async with ClientSession(*streams) as session:
-                await session.initialize()
+        if result.content:
+            for block in result.content:
+                text = getattr(block, "text", None)
+                if not text:
+                    continue
 
-                tools = await session.list_tools()
-                tool_names = [t.name for t in tools.tools]
-
-                tool_name = config.mcp_tool_name
-                if tool_name not in tool_names and tool_names:
-                    logger.warning(
-                        f"[Search] MCP tool '{tool_name}' not found, "
-                        f"using '{tool_names[0]}' instead"
-                    )
-                    tool_name = tool_names[0]
-
-                result = await session.call_tool(
-                    tool_name,
-                    {"query": query},
-                )
-
-                if result.content:
-                    for block in result.content:
-                        text = getattr(block, "text", None)
-                        if not text:
-                            continue
-
-                        try:
-                            data = json.loads(text)
-                            if isinstance(data, list):
-                                return _normalize_mcp_results(data)
-                            if isinstance(data, dict) and "results" in data:
-                                return _normalize_mcp_results(data["results"])
-                            if isinstance(data, dict):
-                                return _normalize_mcp_results([data])
-                        except json.JSONDecodeError:
-                            # Plain text — try to extract URLs from it
-                            import re
-                            urls = re.findall(r'https?://[^\s\)\]\"\']+', text)
-                            if urls:
-                                # Split text into chunks around URLs
-                                return _parse_text_with_urls(text, urls, query)
-                            return [{
-                                "title": query,
-                                "url": "",
-                                "content": text[:4000],
-                                "raw_content": text[:8000],
-                            }]
-                return []
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, list):
+                        return _normalize_mcp_results(data), "mcp"
+                    if isinstance(data, dict) and "results" in data:
+                        return _normalize_mcp_results(data["results"]), "mcp"
+                    if isinstance(data, dict):
+                        return _normalize_mcp_results([data]), "mcp"
+                except json.JSONDecodeError:
+                    urls = re.findall(r'https?://[^\s\)\]\"\']+', text)
+                    if urls:
+                        return _parse_text_with_urls(text, urls, query), "mcp"
+                    return [{
+                        "title": query,
+                        "url": "",
+                        "content": text[:4000],
+                        "raw_content": text[:8000],
+                    }], "mcp"
+        return [], "mcp"
     except Exception as e:
-        logger.error(f"[Search] MCP failed: {e}")
-        return await _search_duckduckgo(query)
+        logger.error(f"[Search] MCP failed: {e}, falling back to DuckDuckGo")
+        # Reset broken session so next call creates a new one
+        await close_mcp_session()
+        results = await _search_duckduckgo(query)
+        return results, "duckduckgo"
 
 
 def _parse_text_with_urls(text: str, urls: list[str], query: str) -> list[dict]:
     """Parse structured plain-text results (Title:/URL:/Content: blocks) from MCP."""
-    import re
-
-    # Try block-based parsing first: split on "Title:" markers
-    # Format: "Title: xxx\nURL: xxx\nContent: xxx"
     blocks = re.split(r'\n(?=Title:\s)', text)
     results = []
     seen_urls = set()
@@ -189,7 +244,6 @@ def _parse_text_with_urls(text: str, urls: list[str], query: str) -> list[dict]:
     if results:
         return results
 
-    # Fallback: no Title:/URL: blocks found, return whole text as single result
     return [{"title": query, "url": "", "content": text[:4000], "raw_content": text[:8000]}]
 
 

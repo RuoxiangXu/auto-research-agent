@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from .config import get_config
 from .database import delete_report, get_report, get_reports, init_db, save_report
 from .graph import build_graph
+from .search import close_mcp_session
 
 
 @asynccontextmanager
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI):
     cfg = get_config()
     logger.info(f"AutoResearch started | LLM={cfg.llm_model_id} | Search={cfg.search_api}")
     yield
+    await close_mcp_session()
     logger.info("AutoResearch stopped")
 
 

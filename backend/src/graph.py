@@ -89,8 +89,15 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
                 "message": f"搜索中：{task['query']}",
                 "task_id": task_id,
             })
-            search_results = await perform_search(task["query"], search_api)
-            logger.info(f"{tag} 搜索完成 → {len(search_results)} 条结果")
+            search_results, actual_provider = await perform_search(task["query"], search_api)
+            logger.info(f"{tag} 搜索完成 → {len(search_results)} 条结果 via {actual_provider}")
+
+            if actual_provider != search_api:
+                await queue.put({
+                    "type": "status",
+                    "message": f"搜索回退：{search_api} → {actual_provider}",
+                    "task_id": task_id,
+                })
 
             await queue.put({
                 "type": "sources",
@@ -167,7 +174,7 @@ async def execute_all_tasks(state: ResearchState, config: RunnableConfig) -> dic
                 })
 
                 logger.info(f"{tag} 补充搜索 | query={refined_query!r}")
-                new_results = await perform_search(refined_query, search_api)
+                new_results, _ = await perform_search(refined_query, search_api)
                 logger.info(f"{tag} 补充搜索完成 → {len(new_results)} 条结果")
                 search_results.extend(new_results)
 
