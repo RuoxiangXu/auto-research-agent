@@ -1,6 +1,9 @@
 import { createApp } from "vue";
+import { marked } from "marked";
 import App from "./App.vue";
 import { createRouter, createWebHistory } from "vue-router";
+
+marked.use({ breaks: true });
 
 const router = createRouter({
   history: createWebHistory(),

@@ -15,20 +15,14 @@ from .prompts import EVALUATOR_PROMPT, PLANNER_PROMPT, REPORTER_PROMPT, SUMMARIZ
 from .search import format_search_context, perform_search
 
 
-_llm_instance: ChatOpenAI | None = None
-
-
 def get_llm() -> ChatOpenAI:
-    global _llm_instance
-    if _llm_instance is None:
-        cfg = get_config()
-        _llm_instance = ChatOpenAI(
-            model=cfg.llm_model_id,
-            api_key=cfg.llm_api_key,
-            base_url=cfg.llm_base_url or None,
-            temperature=0.0,
-        )
-    return _llm_instance
+    cfg = get_config()
+    return ChatOpenAI(
+        model=cfg.llm_model_id,
+        api_key=cfg.llm_api_key,
+        base_url=cfg.llm_base_url or None,
+        temperature=0.0,
+    )
 
 
 def _system_msg(prompt: str) -> SystemMessage:
