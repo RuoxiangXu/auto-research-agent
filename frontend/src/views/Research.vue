@@ -25,7 +25,7 @@ let abortController: AbortController | null = null;
 
 // ── Computed ──────────────────────────────────────────────────────────────
 const completedCount = computed(
-  () => tasks.value.filter((t) => t.status === "completed").length
+  () => tasks.value.filter((t) => t.status === "completed" || t.status === "summarized").length
 );
 const totalCount = computed(() => tasks.value.length);
 const progressPct = computed(() =>
